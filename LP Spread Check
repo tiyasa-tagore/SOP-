@@ -1,0 +1,113 @@
+import os
+import pandas as pd
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+folder_path = '/content/drive/My Drive/Colab Notebooks/Broker/SOP/Spread'
+
+# List all CSV files in the folder
+file_names = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
+
+# Define session time ranges as time strings to match the format of the 'Time' column
+sessions = {
+    'Market-Open Session': ('21:15:00', '23:44:59'),  # Subtract 3 hours
+    'Asia Session': ('23:45:00', '07:00:00'),
+    'London Session': ('07:01:00', '10:59:59'),
+    'London-NY Overlap Session': ('11:00:00', '13:29:59'),
+    'NYSE Session': ('13:30:00', '18:00:00'),
+    'Late Trading Hours Session': ('18:01:00', '19:59:59'),
+    'Market-Closing Session': ('20:00:00', '20:59:59')
+}
+
+# Function to get session name based on the formatted time string
+def get_session(time_value):
+    for session, (start, end) in sessions.items():
+        if start <= time_value <= end:
+            return session
+    return 'Outside Market Hours'
+
+# Loop through each file in the folder and process it
+for file_name in file_names:
+    # Construct the full file path
+    file_path = os.path.join(folder_path, file_name)
+
+    # Load the dataset
+    df = pd.read_csv(file_path, delimiter='\t')
+
+    # Rename columns
+    df.rename(columns={
+        '<DATE>': 'Date',
+        '<TIME>': 'Time',
+        '<BID>': 'Bid',
+        '<ASK>': 'Ask',
+        '<LAST>': 'Last',
+        '<VOLUME>': 'Volume',
+        '<FLAGS>': 'Flags'
+    }, inplace=True)
+
+    df.drop(columns=['Last', 'Volume', 'Flags'], inplace=True, errors='ignore')
+
+    # Convert the 'Time' column, including milliseconds, and format it correctly
+    df['Time'] = pd.to_datetime(df['Time'], format='%H:%M:%S.%f').dt.strftime('%H:%M:%S.%f').str[:-3]
+
+    # Apply session name based on the 'Time' column
+    df['Session'] = df['Time'].apply(get_session)
+
+    # Filter out rows where session is 'NaT'
+    df = df[df['Session'] != 'NaT']
+
+    # Calculate the spread (Ask - Bid) and store in the Spread column, converted to pips (multiply by 100000)
+    df['Spread'] = (df['Ask'] - df['Bid']) * 100000
+
+    # Calculate the Spike (maximum difference between consecutive Bid values within each session)
+    df['Bid_Diff'] = df.groupby('Session')['Bid'].diff().abs()  # Get the absolute difference of consecutive Bid values
+    spike_info = df.groupby('Session')['Bid_Diff'].max().reset_index(name='Spike')  # Get max difference per session
+
+    # Group data by session and calculate statistics
+    session_stats = df.groupby('Session').agg(
+        Min_Spread=('Spread', 'min'),
+        Max_Spread=('Spread', 'max'),
+        Avg_Spread=('Spread', 'mean'),
+        No_of_ticks_per_Session=('Spread', 'count'),
+    ).reset_index()
+
+    # Calculate the most common spread and its count within each session
+    most_spread_info = df.groupby('Session')['Spread'].agg(lambda x: x.value_counts().idxmax()).reset_index(name='Most_Spread')
+    count_info = df.groupby('Session')['Spread'].agg(lambda x: x.value_counts().max()).reset_index(name='Count')
+
+    # Group by session and exact minute including seconds for tick calculations
+    df['Minute'] = df['Time'].apply(lambda x: x[:5])  # Keep the hour and minute for tick analysis
+
+    # Calculate number of ticks per minute
+    ticks_per_minute = df.groupby(['Session', 'Minute']).size().reset_index(name='No_of_ticks_per_minute')
+
+    # Get average number of ticks per minute for each session
+    avg_ticks_per_minute = ticks_per_minute.groupby('Session')['No_of_ticks_per_minute'].mean().reset_index(name='Avg_ticks_per_minute')
+
+    # Get max and min ticks per minute for each session
+    max_ticks_info = ticks_per_minute.groupby('Session')['No_of_ticks_per_minute'].max().reset_index(name='Max_ticks_per_minute')
+    min_ticks_info = ticks_per_minute.groupby('Session')['No_of_ticks_per_minute'].min().reset_index(name='Min_ticks_per_minute')
+
+    # Merge tick info, average ticks per minute, spike information, most spread, and count back into session stats
+    session_stats = pd.merge(session_stats, max_ticks_info, on='Session', how='left')
+    session_stats = pd.merge(session_stats, min_ticks_info, on='Session', how='left')
+    session_stats = pd.merge(session_stats, avg_ticks_per_minute, on='Session', how='left')
+    session_stats = pd.merge(session_stats, spike_info, on='Session', how='left')
+    session_stats = pd.merge(session_stats, most_spread_info, on='Session', how='left')
+    session_stats = pd.merge(session_stats, count_info, on='Session', how='left')
+
+    # Multiply the 'Spike' column by 100000
+    session_stats['Spike'] = session_stats['Spike'] * 100000
+
+    # Ensure that only one entry per session is printed (minute with the highest tick count)
+    final_output = session_stats.drop_duplicates(subset=['Session'])
+
+    # Create an output file name based on the input file name
+    output_file_name = f"{os.path.splitext(file_name)[0]}_Session_wise_spread.csv"
+    output_file_path = os.path.join(folder_path, output_file_name)
+
+    # Save the final output with one entry per session to a new CSV file
+    final_output.to_csv(output_file_path, index=False)
+
+    print(f"Processed {file_name} and saved summary to {output_file_name}")
